@@ -392,7 +392,7 @@ cd web && pnpm build
 |:-----|:-------|:-----|
 | `--output-dir` | `data` | 输出目录 |
 | `--window-hours` | `24` | 时间窗口（小时） |
-| `--archive-days` | `45` | 归档保留天数 |
+| `--archive-days` | `45` | 按发布时间或首次发现时间保留，最少 7 天；另受容量上限约束 |
 | `--translate-max-new` | `80` | 单次最大翻译数 |
 | `--rss-opml` | `./feeds/follow.opml` | OPML 订阅文件 |
 | `--rss-max-feeds` | `0` | 最大 RSS 数量 |
@@ -407,11 +407,13 @@ cd web && pnpm build
 |:-----|:-----|
 | `latest-24h.json` | 最近 24 小时 AI 资讯 |
 | `latest-7d.json` | 最近 7 天 AI 资讯 |
-| `archive.json` | 历史归档（45 天） |
-| `source-status.json` | 数据源抓取状态 |
+| `archive.json` | 滚动归档（最多 45 天 / 4 万条 / 20 MiB，优先保留较新资讯） |
+| `source-status.json` | 数据源抓取状态及归档/缓存淘汰统计 |
 | `opml-feeds.json` | OPML 订阅源列表 |
 | `waytoagi-7d.json` | WaytoAGI 近 7 天更新 |
-| `title-zh-cache.json` | 标题翻译缓存 |
+| `title-zh-cache.json` | 仅保留归档中引用的标题翻译（最多 2 万条 / 4 MiB） |
+
+自动更新恢复步骤、Actions 精确白名单和验证命令见 [自动更新维护说明](docs/automatic-updates.md)。
 
 ### 数据结构
 

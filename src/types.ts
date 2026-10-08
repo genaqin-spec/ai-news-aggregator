@@ -87,6 +87,16 @@ export interface ArchivePayload {
 
 export interface StatusPayload {
   generated_at: string;
+  storage?: {
+    archive_days: number;
+    expired_items: number;
+    archive_capacity_evicted: number;
+    archive_bytes: number;
+    snapshot_24h_evicted: number;
+    snapshot_7d_evicted: number;
+    cache_removed: number;
+    cache_bytes: number;
+  };
   sites: FetchStatus[];
   successful_sites: number;
   failed_sites: string[];

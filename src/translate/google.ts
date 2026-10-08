@@ -123,7 +123,7 @@ export async function addBilingualFields(
 export function loadTitleZhCache(data: Record<string, string>): Map<string, string> {
   const cache = new Map<string, string>();
   for (const [k, v] of Object.entries(data)) {
-    if (k.trim() && v.trim()) {
+    if (k.trim() && typeof v === 'string' && v.trim()) {
       cache.set(k, v);
     }
   }

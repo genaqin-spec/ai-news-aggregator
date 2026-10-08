@@ -2,6 +2,7 @@ import { Command } from 'commander';
 import { existsSync } from 'fs';
 import { readFile } from 'fs/promises';
 import { join, resolve } from 'path';
+import { pathToFileURL } from 'url';
 import pLimit from 'p-limit';
 
 import { CONFIG } from './config.js';
@@ -12,7 +13,6 @@ import type {
   RssFeedStatus,
   SiteStat,
   LatestPayload,
-  ArchivePayload,
   StatusPayload,
 } from './types.js';
 import { utcNow, toISOString, parseISO } from './utils/date.js';
@@ -21,8 +21,10 @@ import { maybeFixMojibake } from './utils/text.js';
 import { makeItemId } from './utils/hash.js';
 import { createAllFetchers, runFetcher, fetchOpmlRss, fetchWaytoagiRecent7d } from './fetchers/index.js';
 import { isAiRelated, dedupeItemsByTitleUrl, normalizeAihubTodayRecords } from './filters/index.js';
-import { addBilingualFields, loadTitleZhCache, cacheToPojo } from './translate/index.js';
+import { addBilingualFields, loadTitleZhCache } from './translate/index.js';
 import { writeJson } from './output/index.js';
+import { loadArchive } from './storage/archive-reader.js';
+import { expireArchive, boundArchive, boundTitleCache, boundPayload, STORAGE_LIMITS } from './storage/retention.js';
 
 function eventTime(record: ArchiveItem): Date | null {
   if (record.site_id === 'opmlrss') {
@@ -46,34 +48,6 @@ function normalizeSourceForDisplay(siteId: string, source: string, url: string):
   return src;
 }
 
-async function loadArchive(path: string): Promise<Map<string, ArchiveItem>> {
-  const archive = new Map<string, ArchiveItem>();
-  if (!existsSync(path)) return archive;
-
-  try {
-    const content = await readFile(path, 'utf-8');
-    const payload = JSON.parse(content);
-    const items = payload.items || [];
-
-    if (Array.isArray(items)) {
-      for (const it of items) {
-        if (it.id) archive.set(it.id, it);
-      }
-    } else if (typeof items === 'object') {
-      for (const [id, it] of Object.entries(items)) {
-        if (typeof it === 'object' && it !== null) {
-          (it as ArchiveItem).id = id;
-          archive.set(id, it as ArchiveItem);
-        }
-      }
-    }
-  } catch {
-    // ignore
-  }
-
-  return archive;
-}
-
 async function loadTitleCache(path: string): Promise<Map<string, string>> {
   if (!existsSync(path)) return new Map();
   try {
@@ -85,7 +59,7 @@ async function loadTitleCache(path: string): Promise<Map<string, string>> {
   }
 }
 
-async function main(): Promise<number> {
+export async function main(args: string[] = process.argv): Promise<number> {
   const program = new Command();
 
   program
@@ -93,16 +67,19 @@ async function main(): Promise<number> {
     .description('Aggregate AI news updates from multiple sources')
     .option('--output-dir <dir>', 'Directory for output JSON files', 'data')
     .option('--window-hours <hours>', '24h window size', '24')
-    .option('--archive-days <days>', 'Keep archive for N days', '45')
+    .option('--archive-days <days>', 'Keep archive for N days (minimum 7)', String(STORAGE_LIMITS.archiveDays))
     .option('--translate-max-new <count>', 'Max new EN->ZH title translations per run', '80')
     .option('--rss-opml <path>', 'Optional OPML file path to include RSS sources', CONFIG.rss.defaultOpmlPath)
     .option('--rss-max-feeds <count>', 'Optional max OPML RSS feeds to fetch (0 means all)', '0')
-    .parse();
+    .parse(args);
 
   const opts = program.opts();
   const outputDir = resolve(opts.outputDir);
   const windowHours = parseInt(opts.windowHours);
-  const archiveDays = parseInt(opts.archiveDays);
+  const archiveDays = Number(opts.archiveDays);
+  if (!Number.isInteger(archiveDays) || archiveDays < 7) {
+    throw new Error('--archive-days must be an integer >= 7');
+  }
   const translateMaxNew = parseInt(opts.translateMaxNew);
   const rssOpml = opts.rssOpml;
   const rssMaxFeeds = parseInt(opts.rssMaxFeeds);
@@ -209,17 +186,10 @@ async function main(): Promise<number> {
     }
   }
 
-  const keepAfter = new Date(now.getTime() - archiveDays * 24 * 60 * 60 * 1000);
-  for (const [id, record] of archive) {
-    const ts =
-      parseISO(record.last_seen_at) ||
-      parseISO(record.published_at) ||
-      parseISO(record.first_seen_at) ||
-      now;
-    if (ts < keepAfter) {
-      archive.delete(id);
-    }
-  }
+  const expiredItems = expireArchive(archive, now, archiveDays);
+  const boundedArchive = boundArchive(archive, now);
+  const archivePayload = boundedArchive.payload;
+  console.log(`Archive: expired=${expiredItems}, capacity_evicted=${boundedArchive.dropped}, bytes=${boundedArchive.bytes}`);
 
   function filterItemsByWindow(hours: number): ArchiveItem[] {
     const windowStart = new Date(now.getTime() - hours * 60 * 60 * 1000);
@@ -227,7 +197,7 @@ async function main(): Promise<number> {
 
     for (const record of archive.values()) {
       const ts = eventTime(record);
-      if (!ts || ts < windowStart) continue;
+      if (!ts || ts < windowStart || ts > now) continue;
 
       const normalized = { ...record };
       normalized.title = maybeFixMojibake(normalized.title || '');
@@ -313,7 +283,7 @@ async function main(): Promise<number> {
       total_items_raw: itemsAll.length,
       total_items_all_mode: itemsAllDedup.length,
       topic_filter: 'ai_tech_robotics',
-      archive_total: archive.size,
+      archive_total: archivePayload.total_items,
       site_count: siteStat.size,
       source_count: new Set(itemsAiDedup.map((i) => `${i.site_id}::${i.source}`)).size,
       site_stats: Array.from(siteStat.values()).sort((a, b) => b.count - a.count),
@@ -348,21 +318,36 @@ async function main(): Promise<number> {
   });
   console.log(`🤖 24h AI-related items: ${items24hAi.length} / ${items24hAll.length}`);
 
-  const latest24hPayload = buildPayload(items24hAll, items24hAi, windowHours);
-  const latest7dPayload = buildPayload(items7dAllFinal, items7dAiFinal, 168);
-
-  const archivePayload: ArchivePayload = {
-    generated_at: toISOString(now)!,
-    total_items: archive.size,
-    items: Array.from(archive.values()).sort((a, b) => {
-      const timeA = parseISO(a.last_seen_at)?.getTime() ?? 0;
-      const timeB = parseISO(b.last_seen_at)?.getTime() ?? 0;
-      return timeB - timeA;
-    }),
-  };
+  function boundSnapshot(payload: LatestPayload) {
+    return boundPayload(payload.items, (items): LatestPayload => ({
+      ...payload,
+      items,
+      total_items: items.length,
+      source_count: new Set(items.map(i => `${i.site_id}::${i.source}`)).size,
+      site_stats: payload.site_stats.map(stat => ({
+        ...stat, count: items.filter(item => item.site_id === stat.site_id).length,
+      })).sort((a, b) => b.count - a.count),
+    }), STORAGE_LIMITS.snapshotBytes);
+  }
+  const latest24h = boundSnapshot(buildPayload(items24hAll, items24hAi, windowHours));
+  const latest7d = boundSnapshot(buildPayload(items7dAllFinal, items7dAiFinal, 168));
+  const latest24hPayload = latest24h.payload;
+  const latest7dPayload = latest7d.payload;
+  const boundedCache = boundTitleCache(titleCache, boundedArchive.items);
+  titleCache = boundedCache.cache;
 
   const statusPayload: StatusPayload = {
     generated_at: toISOString(now)!,
+    storage: {
+      archive_days: archiveDays,
+      expired_items: expiredItems,
+      archive_capacity_evicted: boundedArchive.dropped,
+      archive_bytes: boundedArchive.bytes,
+      snapshot_24h_evicted: latest24h.dropped,
+      snapshot_7d_evicted: latest7d.dropped,
+      cache_removed: boundedCache.removed,
+      cache_bytes: boundedCache.bytes,
+    },
     sites: statuses,
     successful_sites: statuses.filter((s) => s.ok).length,
     failed_sites: statuses.filter((s) => !s.ok).map((s) => s.site_id),
@@ -406,11 +391,11 @@ async function main(): Promise<number> {
   await writeJson(archivePath, archivePayload);
   await writeJson(statusPath, statusPayload);
   await writeJson(waytoagiPath, waytoagiPayload);
-  await writeJson(titleCachePath, cacheToPojo(titleCache));
+  await writeJson(titleCachePath, boundedCache.payload);
 
   console.log(`  ✅ ${latest24hPath} (${latest24hPayload.total_items} items)`);
   console.log(`  ✅ ${latest7dPath} (${latest7dPayload.total_items} items)`);
-  console.log(`  ✅ ${archivePath} (${archive.size} items)`);
+  console.log(`  ✅ ${archivePath} (${archivePayload.total_items} items)`);
   console.log(`  ✅ ${statusPath}`);
   console.log(`  ✅ ${waytoagiPath}`);
   console.log(`  ✅ ${titleCachePath} (${titleCache.size} entries)`);
@@ -420,9 +405,11 @@ async function main(): Promise<number> {
   return 0;
 }
 
-main()
-  .then((code) => process.exit(code))
-  .catch((err) => {
-    console.error(err);
-    process.exit(1);
-  });
+if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
+  main()
+    .then((code) => process.exit(code))
+    .catch((err) => {
+      console.error(err);
+      process.exit(1);
+    });
+}
